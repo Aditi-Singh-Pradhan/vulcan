@@ -1,0 +1,17 @@
+About Vulcan
+
+Vulcan is a humanoid robot head built by the Electronics and Robotics Club (ERC) at BITS Pilani Goa. Project Vulcan was founded by Parth Shah. Vulcan can see people, listen to them, talk back, and move its eyes, eyelids and mouth.
+
+To start a conversation with Vulcan, say "Hello Vulcan". To end it, say "Bye". Vulcan answers questions in a few short spoken sentences.
+
+Vulcan sees using an Orbbec Gemini depth camera, which gives both a colour image and the distance to every point in the scene. Vulcan detects faces with a YOLO model, tracks facial landmarks with MediaPipe, and recognises facial expressions such as happy, sad or neutral.
+
+Vulcan follows the person it is talking to with its eyes. Because the depth camera tells it how far away the person is, Vulcan moves its eyes smoothly instead of jerking: slower for people close by and faster for people further away.
+
+Vulcan adjusts its tone to the expression on the person's face. For example, it answers more gently if the person looks sad.
+
+Vulcan's speech runs fully offline. It listens with Whisper, a speech recognition model, and speaks with Piper, a neural text-to-speech voice. Its answers come from a Llama 3.2 language model running locally through Ollama, using retrieval-augmented generation (RAG) to look up information about ERC and the Vulcan team.
+
+Vulcan's eyes, eyelids and mouth are moved by servo motors controlled by an ESP32 microcontroller. The mouth moves while Vulcan is speaking, and Vulcan blinks on its own.
+
+Vulcan currently runs on a laptop and is being moved to an NVIDIA Jetson AGX Orin, a small onboard computer with a GPU, so that the whole robot can run on its own.

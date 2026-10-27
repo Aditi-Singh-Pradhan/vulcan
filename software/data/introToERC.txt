@@ -1,0 +1,15 @@
+About ERC
+
+The Electronics and Robotics Club (ERC) is a student club at BITS Pilani Goa campus. ERC members have interests ranging from electronics and machine learning to mechanical design.
+
+ERC was founded in 2008 and is one of the oldest clubs on the BITS Goa campus. It has grown into a platform for learning and experimenting with science and engineering, and applying them in robotics.
+
+ERC welcomes electronics engineers, mechanical enthusiasts and coders. Members are organised into teams working on hardware design, open source libraries, and full robots built from scratch.
+
+ERC holds weekly discussion sessions, demonstrations and presentations where members share their experience and expertise.
+
+Over the years, ERC has shifted from competing in robotics competitions to research-oriented projects with real world applications. ERC tries to keep up with the latest developments in robotics research and industry.
+
+ERC also builds exhibition projects, which are displayed at the annual technical fest on campus and at other events through the year.
+
+ERC is open to anyone with a general interest in engineering who wants to explore robotics. Anyone interested can get in touch with the club.
