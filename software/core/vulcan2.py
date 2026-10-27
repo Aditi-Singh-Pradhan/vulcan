@@ -37,6 +37,9 @@ ARDUINO_BAUD = 115200
 YOLO_MODEL_PATH = PROJECT_ROOT / "software" / "models" / "model.pt"
 YOLO_CONFIDENCE = 0.5
 
+WEBCAM_INDEX = 0          # laptop camera used when no Orbbec is plugged in
+SHOW_LANDMARKS = False    # True = draw MediaPipe face-mesh dots (slower)
+
 SERVO_COOLDOWN = 0.15
 EXPRESSION_COOLDOWN = 1.0
 IDLE_CMD_6_INTERVAL = 50
@@ -219,9 +222,7 @@ def run_vision(terminate_event, conversation_flag, shared_state, arduino_queue):
     import cv2
     import numpy as np
     import serial
-    import mediapipe as mp_lib
     from ultralytics import YOLO
-    from pyorbbecsdk import Pipeline, Config, OBSensorType, OBFormat, OBAlignMode
     import vision.m_expression as exp_re
 
     # --- Arduino (only this process touches the serial port) ---
@@ -244,65 +245,17 @@ def run_vision(terminate_event, conversation_flag, shared_state, arduino_queue):
     if not YOLO_MODEL_PATH.exists():
         raise FileNotFoundError(f"YOLO model not found: {YOLO_MODEL_PATH}")
     face_model = YOLO(str(YOLO_MODEL_PATH))
-    face_mesh = mp_lib.solutions.face_mesh.FaceMesh(
-        static_image_mode=False, max_num_faces=1, refine_landmarks=True,
-        min_detection_confidence=0.5, min_tracking_confidence=0.5,
-    )
 
-    # --- Camera ---
-    def make_color_profile(pipeline):
-        profiles = pipeline.get_stream_profile_list(OBSensorType.COLOR_SENSOR)
-        try:
-            return profiles.get_video_stream_profile(640, 480, OBFormat.MJPG, 30)
-        except Exception:
-            return profiles.get_default_video_stream_profile()
+    face_mesh = None
+    if SHOW_LANDMARKS:
+        import mediapipe as mp_lib
+        face_mesh = mp_lib.solutions.face_mesh.FaceMesh(
+            static_image_mode=False, max_num_faces=1, refine_landmarks=True,
+            min_detection_confidence=0.5, min_tracking_confidence=0.5,
+        )
 
-    depth_enabled = False
-    try:
-        pipeline = Pipeline()
-        config = Config()
-        config.enable_stream(make_color_profile(pipeline))
-        depth_profiles = pipeline.get_stream_profile_list(OBSensorType.DEPTH_SENSOR)
-        try:
-            depth_profile = depth_profiles.get_video_stream_profile(640, 480, OBFormat.Y16, 30)
-        except Exception:
-            depth_profile = depth_profiles.get_default_video_stream_profile()
-        config.enable_stream(depth_profile)
-        try:
-            config.set_align_mode(OBAlignMode.HW_MODE)
-        except Exception:
-            pass
-        pipeline.start(config)
-        depth_enabled = True
-        print("[CAMERA] Color + depth started.")
-    except Exception as exc:
-        print(f"[CAMERA] Depth failed ({exc}), trying color only...")
-        pipeline = Pipeline()
-        config = Config()
-        config.enable_stream(make_color_profile(pipeline))
-        pipeline.start(config)
-        print("[CAMERA] Color-only started.")
-
-    def decode(color_frame):
-        data = np.frombuffer(color_frame.get_data(), dtype=np.uint8)
-        fmt = color_frame.get_format()
-        w, h = color_frame.get_width(), color_frame.get_height()
-        if fmt == OBFormat.MJPG:
-            return cv2.imdecode(data, cv2.IMREAD_COLOR)
-        if fmt == OBFormat.RGB:
-            return cv2.cvtColor(data.reshape(h, w, 3), cv2.COLOR_RGB2BGR)
-        if fmt == OBFormat.BGR:
-            return data.reshape(h, w, 3).copy()
-        return None
-
-    def depth_array(depth_frame):
-        if depth_frame is None:
-            return None
-        try:
-            w, h = depth_frame.get_width(), depth_frame.get_height()
-            return np.frombuffer(depth_frame.get_data(), dtype=np.uint16)[:w * h].reshape(h, w)
-        except Exception:
-            return None
+    # --- Camera: Orbbec depth camera, or laptop webcam as fallback ---
+    camera = open_camera(cv2, np)
 
     cv2.namedWindow("Vulcan", cv2.WINDOW_AUTOSIZE)
     print("[VISION] Window created.")
@@ -324,25 +277,11 @@ def run_vision(terminate_event, conversation_flag, shared_state, arduino_queue):
                 except queue.Empty:
                     break
 
-            try:
-                frameset = pipeline.wait_for_frames(1000)
-            except Exception:
-                cv2.waitKey(1)
-                continue
-            if frameset is None:
-                cv2.waitKey(1)
-                continue
-
-            color_frame = frameset.get_color_frame()
-            if color_frame is None:
-                cv2.waitKey(1)
-                continue
-            frame = decode(color_frame)
+            frame, depth_data = camera.read()
             if frame is None:
                 cv2.waitKey(1)
                 continue
 
-            depth_data = depth_array(frameset.get_depth_frame()) if depth_enabled else None
             h, w = frame.shape[:2]
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             now = time.time()
@@ -372,7 +311,7 @@ def run_vision(terminate_event, conversation_flag, shared_state, arduino_queue):
 
                     face_cx, face_cy = (x1 + x2) // 2, (y1 + y2) // 2
 
-                    # Depth at face center (median of 10x10 patch)
+                    # Depth at face center (median of 10x10 patch). Webcam -> no depth.
                     depth_mm = 0
                     if depth_data is not None and depth_data.size:
                         dy, dx = depth_data.shape
@@ -400,16 +339,17 @@ def run_vision(terminate_event, conversation_flag, shared_state, arduino_queue):
                             prev_norm_y = smooth_y
                         last_servo_time = now
 
-                    # MediaPipe landmarks
-                    face_crop = frame[y1:y2, x1:x2]
-                    if face_crop.size:
-                        mesh = face_mesh.process(cv2.cvtColor(face_crop, cv2.COLOR_BGR2RGB))
-                        if mesh.multi_face_landmarks:
-                            crop_h, crop_w = face_crop.shape[:2]
-                            for lm in mesh.multi_face_landmarks[0].landmark:
-                                px = min(max(int(lm.x * crop_w + x1), 0), w - 1)
-                                py = min(max(int(lm.y * crop_h + y1), 0), h - 1)
-                                cv2.circle(frame, (px, py), 1, (0, 255, 255), -1)
+                    # MediaPipe landmark dots (off by default, see SHOW_LANDMARKS)
+                    if face_mesh is not None:
+                        face_crop = frame[y1:y2, x1:x2]
+                        if face_crop.size:
+                            mesh = face_mesh.process(cv2.cvtColor(face_crop, cv2.COLOR_BGR2RGB))
+                            if mesh.multi_face_landmarks:
+                                crop_h, crop_w = face_crop.shape[:2]
+                                for lm in mesh.multi_face_landmarks[0].landmark:
+                                    px = min(max(int(lm.x * crop_w + x1), 0), w - 1)
+                                    py = min(max(int(lm.y * crop_h + y1), 0), h - 1)
+                                    cv2.circle(frame, (px, py), 1, (0, 255, 255), -1)
 
                     # Expression
                     expression = "unknown"
@@ -426,8 +366,11 @@ def run_vision(terminate_event, conversation_flag, shared_state, arduino_queue):
 
                     # Draw
                     cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                    depth_text = f"{depth_mm / 1000:.1f}m" if depth_mm > 0 else "no depth"
-                    cv2.putText(frame, f"{expression} ({conf:.2f}) {depth_text}",
+                    if camera.has_depth:
+                        depth_text = f" {depth_mm / 1000:.1f}m" if depth_mm > 0 else " no depth"
+                    else:
+                        depth_text = ""
+                    cv2.putText(frame, f"{expression} ({conf:.2f}){depth_text}",
                                 (x1, max(20, y1 - 10)), cv2.FONT_HERSHEY_SIMPLEX,
                                 0.6, (0, 255, 0), 2)
                     break  # first face only
@@ -435,23 +378,137 @@ def run_vision(terminate_event, conversation_flag, shared_state, arduino_queue):
             fps = 1.0 / max(now - prev_frame_time, 1e-6)
             prev_frame_time = now
             status = "TALKING" if conversation_flag.value else "IDLE"
-            cv2.putText(frame, f"FPS: {fps:.1f}  {status}", (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+            cv2.putText(frame, f"FPS: {fps:.1f}  {status}  [{camera.name}]", (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
             cv2.imshow("Vulcan", frame)
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 terminate_event.set()
                 break
     finally:
-        try:
-            pipeline.stop()
-        except Exception:
-            pass
+        camera.close()
         cv2.destroyAllWindows()
-        face_mesh.close()
+        if face_mesh is not None:
+            face_mesh.close()
         if arduino is not None:
             arduino.close()
         print("[VISION] Stopped.")
+
+
+# =====================================================================
+# Cameras — both give the same interface:
+#   .read() -> (bgr_frame or None, depth_array or None)
+#   .close(), .name, .has_depth
+# =====================================================================
+class OrbbecCamera:
+    name = "Orbbec"
+
+    def __init__(self, cv2, np):
+        from pyorbbecsdk import Pipeline, Config, OBSensorType, OBFormat, OBAlignMode
+        self.cv2, self.np, self.OBFormat = cv2, np, OBFormat
+
+        def color_profile(pipeline):
+            profiles = pipeline.get_stream_profile_list(OBSensorType.COLOR_SENSOR)
+            try:
+                return profiles.get_video_stream_profile(640, 480, OBFormat.MJPG, 30)
+            except Exception:
+                return profiles.get_default_video_stream_profile()
+
+        try:
+            pipeline = Pipeline()
+            config = Config()
+            config.enable_stream(color_profile(pipeline))
+            depth_profiles = pipeline.get_stream_profile_list(OBSensorType.DEPTH_SENSOR)
+            try:
+                depth_profile = depth_profiles.get_video_stream_profile(640, 480, OBFormat.Y16, 30)
+            except Exception:
+                depth_profile = depth_profiles.get_default_video_stream_profile()
+            config.enable_stream(depth_profile)
+            try:
+                config.set_align_mode(OBAlignMode.HW_MODE)
+            except Exception:
+                pass
+            pipeline.start(config)
+            self.has_depth = True
+            print("[CAMERA] Orbbec color + depth started.")
+        except Exception as exc:
+            print(f"[CAMERA] Orbbec depth failed ({exc}), trying color only...")
+            pipeline = Pipeline()   # raises if no Orbbec is plugged in
+            config = Config()
+            config.enable_stream(color_profile(pipeline))
+            pipeline.start(config)
+            self.has_depth = False
+            print("[CAMERA] Orbbec color-only started.")
+        self.pipeline = pipeline
+
+    def read(self):
+        try:
+            frameset = self.pipeline.wait_for_frames(1000)
+        except Exception:
+            return None, None
+        if frameset is None:
+            return None, None
+        color = frameset.get_color_frame()
+        if color is None:
+            return None, None
+
+        np, cv2, F = self.np, self.cv2, self.OBFormat
+        data = np.frombuffer(color.get_data(), dtype=np.uint8)
+        w, h, fmt = color.get_width(), color.get_height(), color.get_format()
+        if fmt == F.MJPG:
+            frame = cv2.imdecode(data, cv2.IMREAD_COLOR)
+        elif fmt == F.RGB:
+            frame = cv2.cvtColor(data.reshape(h, w, 3), cv2.COLOR_RGB2BGR)
+        elif fmt == F.BGR:
+            frame = data.reshape(h, w, 3).copy()
+        else:
+            frame = None
+
+        depth = None
+        if self.has_depth:
+            d = frameset.get_depth_frame()
+            if d is not None:
+                try:
+                    dw, dh = d.get_width(), d.get_height()
+                    depth = np.frombuffer(d.get_data(), dtype=np.uint16)[:dw * dh].reshape(dh, dw)
+                except Exception:
+                    depth = None
+        return frame, depth
+
+    def close(self):
+        try:
+            self.pipeline.stop()
+        except Exception:
+            pass
+
+
+class WebcamCamera:
+    name = "Webcam"
+    has_depth = False
+
+    def __init__(self, cv2, index):
+        self.cap = cv2.VideoCapture(index)
+        if not self.cap.isOpened():
+            raise RuntimeError(f"could not open webcam index {index}")
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        print(f"[CAMERA] Laptop webcam (index {index}) started. No depth.")
+
+    def read(self):
+        ok, frame = self.cap.read()
+        return (frame if ok else None), None
+
+    def close(self):
+        self.cap.release()
+
+
+def open_camera(cv2, np):
+    """Use the Orbbec depth camera if it's plugged in, otherwise the laptop webcam."""
+    try:
+        return OrbbecCamera(cv2, np)
+    except Exception as exc:
+        print(f"[CAMERA] No Orbbec camera ({exc}). Falling back to laptop webcam.")
+    return WebcamCamera(cv2, WEBCAM_INDEX)
 
 
 # =====================================================================
