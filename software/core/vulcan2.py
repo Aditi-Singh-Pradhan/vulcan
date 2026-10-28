@@ -31,7 +31,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "software" / "llm" / "rag"))
 # ---------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------
-ARDUINO_PORT = "COM8"          # change to /dev/ttyUSB0 or /dev/ttyACM0 on Linux
+ARDUINO_PORT = "/dev/ttyUSB0"   # Linux. Find yours with: ls /dev/ttyUSB* /dev/ttyACM*  (Windows: "COM8")
 ARDUINO_BAUD = 115200
 
 YOLO_MODEL_PATH = PROJECT_ROOT / "software" / "models" / "model.pt"
@@ -47,15 +47,25 @@ IDLE_CMD_5_INTERVAL = 30
 
 SAMPLE_RATE = 16000
 CHUNK_DURATION = 0.5
-SILENCE_THRESHOLD = 0.20       # room noise on your mic sits around 0.05-0.15
+# Volume above which audio counts as speech.
+#   None = auto: measure room noise for 1.5 s at startup (stay quiet!) and set it from that.
+#   Or a number, e.g. 0.20 for the laptop mic.
+SILENCE_THRESHOLD = None
+NOISE_MULTIPLIER = 3.0         # auto mode: speech must be this many times louder than the room
+MIC_DEBUG = False              # True = print the mic level every half second (for tuning)
 SILENCE_LIMIT = 2.0
 MAX_RECORD_SECONDS = 15
+
+# Which microphone to use. None = system default.
+# List mics with:  python3 -c "import sounddevice as sd; print(sd.query_devices())"
+# Then set this to the number (e.g. 11) or part of the name (e.g. "USB").
+MIC_DEVICE = "pulse"   # "pulse" handles sample-rate conversion; falls back to default if missing
 
 # Words Whisper doesn't know. Listing them here makes it much more likely to
 # hear "Vulcan" instead of "Wilkin"/"Elkin". Add names/nicknames as needed.
 WHISPER_HINT = "Hello Vulcan. Vulcan is a robot built by ERC at BITS Pilani Goa."
 
-PIPER_MODEL_PATH = Path("/home/aditi/piper-voices/en_US-lessac-medium.onnx")
+PIPER_MODEL_PATH = Path.home() / "piper-voices" / "en_US-lessac-medium.onnx"
 PIPER_EXECUTABLE = "piper"
 AUDIO_PLAYER = "aplay"
 
@@ -71,6 +81,29 @@ def audio_process(terminate_event, conversation_flag, shared_state, arduino_queu
     from faster_whisper import WhisperModel
     from llm.rag.app_lang2 import response_rag, warmup
     import llm.rag.app_lang2 as rag   # to read rag.LAST_TIMING
+
+    global MIC_DEVICE
+    try:
+        print(f"[AUDIO] Microphone: {sd.query_devices(MIC_DEVICE, 'input')['name']}")
+    except Exception as exc:
+        print(f"[AUDIO] Microphone {MIC_DEVICE!r} not usable ({exc}), using system default")
+        MIC_DEVICE = None
+    # ---- Speech threshold: measure room noise once, unless a fixed value is set ----
+    threshold = SILENCE_THRESHOLD
+    if threshold is None:
+        print("[AUDIO] Calibrating mic, stay quiet for 1.5 s...")
+        try:
+            noise = sd.rec(int(SAMPLE_RATE * 1.5), samplerate=SAMPLE_RATE, channels=1,
+                           dtype="float32", device=MIC_DEVICE)
+            sd.wait()
+            noise_rms = float(np.sqrt(np.mean(np.square(noise))))
+        except Exception as exc:
+            print(f"[AUDIO] Calibration failed ({exc}), using 0.02")
+            noise_rms = 0.02 / NOISE_MULTIPLIER
+        threshold = max(noise_rms * NOISE_MULTIPLIER, 0.005)
+        print(f"[AUDIO] Room noise {noise_rms:.4f} -> speech threshold {threshold:.4f}")
+    else:
+        print(f"[AUDIO] Fixed speech threshold {threshold:.4f}")
 
     print("[AUDIO] Loading Whisper...")
     whisper_model = WhisperModel("small", device="cpu", compute_type="int8")
@@ -133,13 +166,17 @@ def audio_process(terminate_event, conversation_flag, shared_state, arduino_queu
                 if terminate_event.is_set():
                     return None
                 chunk = sd.rec(int(SAMPLE_RATE * CHUNK_DURATION),
-                               samplerate=SAMPLE_RATE, channels=1, dtype="float32")
+                               samplerate=SAMPLE_RATE, channels=1, dtype="float32",
+                               device=MIC_DEVICE)
                 sd.wait()
                 chunk = chunk.flatten()
                 chunks.append(chunk)
 
                 level = float(np.sqrt(np.mean(np.square(chunk)))) if chunk.size else 0.0
-                if level > SILENCE_THRESHOLD:
+                if MIC_DEBUG:
+                    print(f"[MIC] level {level:.4f}  (threshold {threshold:.4f})"
+                          f"{'  <- speech' if level > threshold else ''}")
+                if level > threshold:
                     has_speech = True
                     silence_time = 0.0
                 elif has_speech:
